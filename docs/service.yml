@@ -1,0 +1,16 @@
+kind: Service
+apiVersion: v1
+metadata:
+  name: container-exporter
+  namespace: kubesphere-monitoring-system
+  labels:
+    app: container-exporter
+spec:
+  ports:
+    - name: container-export
+      protocol: TCP
+      port: 9090
+      targetPort: 9090
+  selector:
+    app: container-exporter
+  type: ClusterIP
