@@ -82,6 +82,12 @@ func inspectAllContainersContainerd(socketPath string) {
 		return
 	}
 
+	// 保存当前的 netns
+	origNS, err := os.Open("/proc/self/ns/net")
+	if err != nil {
+		log.Fatalf("error opening current netns: %v", err)
+	}
+
 	// 遍历每个容器并获取详细信息
 	for _, c := range containers {
 		container, err := c.Info(ctx)
@@ -104,47 +110,17 @@ func inspectAllContainersContainerd(socketPath string) {
 		}
 
 		// 获取容器的 PID
-		pid := task.Pid()
+		pid := fmt.Sprintf("%d", task.Pid())
 
-		// 获取容器的网络命名空间
-		nsPath := fmt.Sprintf("/host/proc/%d/ns/net", pid)
-		ns, err := os.Open(nsPath)
+		ipAddress, macAddress, netns, err := GetContainerNetInfo(pid, origNS)
 		if err != nil {
-			log.Printf("Error opening network namespace for container %s: %v", containerID, err)
-			continue
-		}
-		defer ns.Close()
-		// 获取netns
-		fi, err := ns.Stat()
-		if err != nil {
-			log.Printf("Error getting file info for container %s: %v", containerName, err)
-			continue
-		}
-		stat := fi.Sys().(*syscall.Stat_t)
-		netns := fmt.Sprintf("%d", stat.Ino)
-
-		// 切换到容器的网络命名空间
-		err = unix.Setns(int(ns.Fd()), unix.CLONE_NEWNET)
-		if err != nil {
-			log.Printf("Error setting network namespace for container %s: %v", containerID, err)
-			continue
-		}
-
-		// 获取容器的 IP 地址和 MAC 地址
-		ipAddress, macAddress := getContainerNetworkInfo()
-		if ipAddress == "" {
-			log.Printf("Error getting IP Address for container %s", containerID)
-			continue
-		}
-		if macAddress == "" {
-			log.Printf("Error getting MAC Address for container %s", containerID)
-			continue
+			log.Printf("%s: %v", containerName, err)
 		}
 		// 更新 Prometheus 指标，包括宿主机名、容器名、命名空间、Pod名、IP 和 MAC 地址
-
 		containerInfo.WithLabelValues(hostName, containerName, namespace, podName, ipAddress, macAddress, image, netns).Set(1)
 
 	}
+	origNS.Close()
 }
 
 func inspectAllContainersDocker(socketPath string) {
@@ -157,7 +133,7 @@ func inspectAllContainersDocker(socketPath string) {
 	// 获取宿主机名称
 	hostName := getHostName()
 
-	socket := "unix:///host" + socketPath
+	socket := "unix://" + socketPath
 
 	cli, err := client.NewClientWithOpts(
 		client.WithHost(socket),
@@ -177,6 +153,12 @@ func inspectAllContainersDocker(socketPath string) {
 		log.Fatalf("Error getting container list: %v", err)
 	}
 
+	// 保存当前的 netns
+	origNS, err := os.Open("/proc/self/ns/net")
+	if err != nil {
+		log.Fatalf("error opening current netns: %v", err)
+	}
+
 	// 遍历所有容器并获取容器的名称和 PID
 	for _, container := range containers {
 		containerdSpec, err := cli.ContainerInspect(context.Background(), container.ID)
@@ -187,61 +169,66 @@ func inspectAllContainersDocker(socketPath string) {
 
 		// 输出容器的名称和 PID
 		containerName := strings.TrimPrefix(containerdSpec.Name, "/")
-		pid := containerdSpec.State.Pid
+		pid := fmt.Sprintf("%d", containerdSpec.State.Pid)
 		image := containerdSpec.Config.Image
 
-		nsPath := fmt.Sprintf("/host/proc/%d/ns/net", pid)
-
-		ns, err := os.Open(nsPath)
+		ipAddress, macAddress, netns, err := GetContainerNetInfo(pid, origNS)
 		if err != nil {
-			log.Printf("Error opening network namespace for container %s: %v", containerName, err)
-			continue
+			log.Printf("%s: %v", containerName, err)
 		}
-		defer ns.Close()
-
-		// 获取netns
-		fi, err := ns.Stat()
-		if err != nil {
-			log.Printf("Error getting file info for container %s: %v", containerName, err)
-			continue
-		}
-		stat := fi.Sys().(*syscall.Stat_t)
-		netns := fmt.Sprintf("%d", stat.Ino)
-
-		// 切换到容器的网络命名空间
-		err = unix.Setns(int(ns.Fd()), unix.CLONE_NEWNET)
-		if err != nil {
-			log.Printf("Error setting network namespace for container %s: %v", containerName, err)
-			continue
-		}
-
-		// 获取容器的 IP 地址和 MAC 地址
-		ipAddress, macAddress := getContainerNetworkInfo()
-		if ipAddress == "" {
-			log.Printf("Error getting IP Address for container %s", containerName)
-			continue
-		}
-		if macAddress == "" {
-			log.Printf("Error getting MAC Address for container %s", containerName)
-			continue
-		}
-
-		// 调用 dockerContainer 函数处理容器名称
-		podName, namespace = dockerContainer(containerName)
-
 		// 更新 Prometheus 指标，包括宿主机名、容器名、命名空间、Pod名、IP 和 MAC 地址
 		containerInfo.WithLabelValues(hostName, containerName, namespace, podName, ipAddress, macAddress, image, netns).Set(1)
 
 	}
 
+	origNS.Close()
+
+}
+
+func GetContainerNetInfo(pid string, origNS *os.File) (ip, mac, netns string, err error) {
+	// 获取容器的网络命名空间
+	nsPath := fmt.Sprintf("/proc/%v/ns/net", pid)
+	ns, err := os.Open(nsPath)
+	if err != nil {
+		return "", "", "", fmt.Errorf("failed to read netns: %w", err)
+	}
+	defer ns.Close()
+	// 获取netns
+	fi, err := ns.Stat()
+	if err != nil {
+		return "", "", "", fmt.Errorf("failed to read netns: %w", err)
+	}
+	stat := fi.Sys().(*syscall.Stat_t)
+	netns = fmt.Sprintf("%d", stat.Ino)
+
+	// 切换到容器的网络命名空间
+	err = unix.Setns(int(ns.Fd()), unix.CLONE_NEWNET)
+	if err != nil {
+		return "", "", "", fmt.Errorf("error setting network namespace for container %v", err)
+	}
+
+	// 获取容器的 IP 地址和 MAC 地址
+	ipAddress, macAddress := getContainerNetLinkInfo()
+	if ipAddress == "" {
+		return "", "", "", fmt.Errorf("error getting IP Address for container")
+	}
+	if macAddress == "" {
+		return "", "", "", fmt.Errorf("error getting MAC Address for container")
+	}
+
+	// 切回 netns
+	if err := unix.Setns(int(origNS.Fd()), unix.CLONE_NEWNET); err != nil {
+		log.Printf("error restoring original netns: %v", err)
+	}
+	return ipAddress, macAddress, netns, nil
 }
 
 // 获取容器的 IP 地址和 MAC 地址
-func getContainerNetworkInfo() (string, string) {
+func getContainerNetLinkInfo() (string, string) {
 	// 获取网络接口信息
 	links, err := netlink.LinkList()
 	if err != nil {
-		log.Printf("Error getting network interfaces: %v", err)
+		log.Printf("error getting network interfaces: %v", err)
 		return "", ""
 	}
 
@@ -251,7 +238,7 @@ func getContainerNetworkInfo() (string, string) {
 			// 获取 IP 地址
 			addrs, err := netlink.AddrList(link, unix.AF_INET)
 			if err != nil {
-				log.Printf("Error getting addresses: %v", err)
+				log.Printf("error getting addresses: %v", err)
 				return "", ""
 			}
 
