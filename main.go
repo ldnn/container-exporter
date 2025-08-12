@@ -133,7 +133,7 @@ func inspectAllContainersDocker(socketPath string) {
 	// 获取宿主机名称
 	hostName := getHostName()
 
-	socket := "unix://" + socketPath
+	socket := "unix:///host" + socketPath
 
 	cli, err := client.NewClientWithOpts(
 		client.WithHost(socket),
@@ -187,7 +187,7 @@ func inspectAllContainersDocker(socketPath string) {
 
 func GetContainerNetInfo(pid string, origNS *os.File) (ip, mac, netns string, err error) {
 	// 获取容器的网络命名空间
-	nsPath := fmt.Sprintf("/proc/%v/ns/net", pid)
+	nsPath := fmt.Sprintf("/host/proc/%v/ns/net", pid)
 	ns, err := os.Open(nsPath)
 	if err != nil {
 		return "", "", "", fmt.Errorf("failed to read netns: %w", err)
